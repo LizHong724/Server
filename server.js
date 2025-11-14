@@ -1,33 +1,28 @@
-// server.js (MongoDB Atlas용 최종 수정 코드)
-
 const express = require('express');
-const { MongoClient } = require('mongodb'); // MongoDB 드라이버 사용
+const { MongoClient } = require('mongodb');
 const cors = require('cors');
-const path = require('path');
 
 // 💡 환경 변수 설정
-// Render에서 지정해 주는 PORT를 사용하거나, 로컬에서 테스트할 경우 3000을 사용합니다.
+// Render에서 지정해 주는 PORT를 사용합니다.
 const PORT = process.env.PORT || 3000; 
 
 // 🔑 MongoDB 설정: Render 환경 변수에서 URI를 가져옵니다.
 const MONGODB_URI = process.env.MONGODB_URI; 
 if (!MONGODB_URI) {
     console.error("🔴 MONGODB_URI 환경 변수가 설정되지 않았습니다. 서버를 종료합니다.");
-    process.exit(1); // URI가 없으면 서버 시작 불가 (Status 1의 명확한 원인)
+    process.exit(1); 
 }
 
+// MongoClient 인스턴스는 한 번만 생성합니다.
 const client = new MongoClient(MONGODB_URI);
 const DB_NAME = "surveyDB"; 
-const COLLECTION_NAME = "responses"; // MongoDB의 컬렉션(테이블) 이름
+const COLLECTION_NAME = "responses"; 
 
 const app = express();
 
 // --- 미들웨어 설정 ---
-app.use(cors()); // CORS 허용 (GitHub Pages와 통신 가능하게 함)
+app.use(cors()); // CORS 허용
 app.use(express.json()); // JSON 요청 본문 파싱
-
-// --- 정적 파일 제공은 제거했습니다. (GitHub Pages에서 담당) ---
-// 정적 파일 라우팅은 GitHub Pages에서 담당하므로, 이 서버는 API 역할만 수행합니다.
 
 // 헬스 체크용 루트 경로
 app.get('/', (req, res) => {
@@ -36,81 +31,95 @@ app.get('/', (req, res) => {
 
 // --- API 엔드포인트 ---
 
-// 1. 설문조사 응답 제출 API
+/**
+ * 1. 설문조사 응답 제출 API
+ * * ⭐ 핵심 개선: try-catch-finally 블록을 사용하여 MongoDB 연결 관리를 강화합니다.
+ * - 연결 실패, 데이터 삽입 실패 등 모든 오류 발생 시에도 연결을 안전하게 닫고 500 에러를 반환합니다.
+ */
 app.post('/api/submit', async (req, res) => {
     const data = req.body;
-    let mongoClient; // 연결 객체를 함수 스코프 내에서 선언
+    let mongoClient = null; // 연결 객체를 null로 초기화
 
     try {
-        mongoClient = await client.connect(); // 🚀 DB 연결 시도
+        // ⭐ 연결 시도 및 성공 시 mongoClient에 할당
+        mongoClient = await client.connect(); 
         const database = mongoClient.db(DB_NAME);
         const responses = database.collection(COLLECTION_NAME);
 
-        // MongoDB에 저장할 객체 준비
+        // 데이터 가공 (클라이언트에서 'finalReadingDuration'을 'readingDuration'으로 변환)
         const docToInsert = {
             ...data,
-            // SQLite처럼 q1_c를 JSON 문자열로 변환할 필요 없이 배열로 저장 가능
+            // q1_c가 항상 배열이도록 보장
             q1_c: Array.isArray(data.q1_c) ? data.q1_c : (data.q1_c ? [data.q1_c] : []),
-            // finalReadingDuration 키를 readingDuration으로 통일하여 저장
+            // 서버에서 MongoDB 컬럼 이름은 'readingDuration'을 사용
             readingDuration: data.finalReadingDuration, 
             timestamp: new Date(),
-            // consentAgreed를 boolean으로 변환하여 저장 (권장)
             consentAgreed: String(data.consentAgreed).toLowerCase() === 'true'
         };
         
-        // 불필요한 클라이언트 키 (finalReadingDuration) 삭제
+        // 최종 데이터 삽입 전에 임시 키(finalReadingDuration) 삭제
         delete docToInsert.finalReadingDuration;
 
         const result = await responses.insertOne(docToInsert);
 
         res.status(201).json({ message: "Survey submitted successfully!", id: result.insertedId });
     } catch (err) {
-        console.error('🔴 Error inserting data:', err.message);
+        console.error('🔴 Error inserting data:', err.message, err.stack);
+        // 클라이언트에게 500 오류 응답 반환
         return res.status(500).json({ message: "Server error during submission: " + err.message });
     } finally {
-        if (mongoClient) {
-             await client.close(); // 요청이 끝난 후 연결 닫기
+        // ⭐ 연결 객체가 유효할 때만 닫기 (오류로 인해 연결에 실패했더라도 안전하게 처리)
+        if (mongoClient) { 
+            try {
+                await mongoClient.close();
+            } catch (closeErr) {
+                console.error('🔴 Error closing MongoDB connection:', closeErr.message);
+            }
         }
     }
 });
 
-// 2. 결과 데이터 가져오기 API
+/**
+ * 2. 결과 데이터 가져오기 API (안정성 강화)
+ */
 app.get('/api/results', async (req, res) => {
-    let mongoClient;
+    let mongoClient = null;
     
     try {
-        mongoClient = await client.connect(); // 🚀 DB 연결 시도
+        // ⭐ 연결 시도 및 성공 시 mongoClient에 할당
+        mongoClient = await client.connect(); 
         const database = mongoClient.db(DB_NAME);
         const responses = database.collection(COLLECTION_NAME);
         
-        // 최신 응답부터 가져오기 (timestamp 내림차순)
         const results = await responses.find({})
                                         .sort({ timestamp: -1 })
                                         .toArray();
         
-        // 클라이언트(results.html) 요구사항에 맞게 키 이름 조정
+        // 클라이언트(surveyresults.html)가 사용하는 키 이름으로 변환하여 전송
         const processedResults = results.map(row => {
-            // MongoDB의 기본 ID인 _id를 SQLite와 유사한 id로 변환하고, 
-            // 클라이언트에서 사용하는 finalReadingDuration 키를 추가합니다.
             const finalRow = { 
                 ...row, 
                 id: row._id,
-                finalReadingDuration: row.readingDuration // 클라이언트용 키 추가
+                finalReadingDuration: row.readingDuration // 클라이언트용 키로 변환
             };
             
-            delete finalRow._id; // MongoDB의 내부 _id 필드 제거
-            delete finalRow.readingDuration; // 서버 내부용 키 제거
+            delete finalRow._id;
+            delete finalRow.readingDuration; // DB 키는 삭제
 
             return finalRow;
         });
         
         res.json(processedResults);
     } catch (err) {
-        console.error('🔴 Error fetching data:', err.message);
+        console.error('🔴 Error fetching data:', err.message, err.stack);
         return res.status(500).json({ message: "Server error fetching results: " + err.message });
     } finally {
         if (mongoClient) {
-             await client.close(); // 요청이 끝난 후 연결 닫기
+            try {
+                await mongoClient.close();
+            } catch (closeErr) {
+                console.error('🔴 Error closing MongoDB connection after fetching:', closeErr.message);
+            }
         }
     }
 });
@@ -118,5 +127,4 @@ app.get('/api/results', async (req, res) => {
 // --- 서버 시작 ---
 app.listen(PORT, () => {
     console.log(`✅ Server running successfully on port ${PORT}`);
-    console.log(`API URL Example: http://localhost:${PORT}/api/submit`);
 });
